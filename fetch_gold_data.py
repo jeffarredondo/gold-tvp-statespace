@@ -1,3 +1,23 @@
+"""
+Data pipeline: pull gold, real rates, and USD index.
+
+Setup:
+    pip install fredapi yfinance pandas numpy
+    Get a free FRED API key: https://fred.stlouisfed.org/docs/api/api_key.html
+    export FRED_API_KEY=your_key_here      (or pass it in directly below)
+
+Series pulled:
+    DFII10          - 10Y TIPS real yield, from FRED (daily, market days)
+    DTWEXBGS        - Trade-weighted USD index, broad, from FRED (daily)
+    GC=F            - COMEX gold futures continuous contract, from yfinance
+
+Note: FRED discontinued GOLDPMGBD228NLBM/GOLDAMGBD228NLBM (the LBMA fix
+series) -- licensing lapse, not a typo. Gold now comes from yfinance
+instead. GC=F (futures) is used rather than GLD (the ETF) to avoid
+expense-ratio drag distorting the return series; swap GOLD_TICKER to
+"GLD" below if you'd rather track the ETF specifically.
+"""
+
 import os
 import numpy as np
 import pandas as pd
@@ -5,7 +25,7 @@ import yfinance as yf
 from fredapi import Fred
 
 # --- Config ---
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "<YOUR_API_KEY>")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "<KEY>")
 START_DATE = "2003-01-01"  # DFII10 doesn't really start clean until ~2003
 GOLD_TICKER = "GC=F"  # COMEX gold futures; use "GLD" for the ETF instead
 
@@ -42,33 +62,41 @@ def pull_gold_data(ticker: str, start_date: str) -> pd.DataFrame:
     return gold
 
 
+CORE_SERIES = ["gold", "real_rate", "usd_index"]  # required for the locked model
+OPTIONAL_SERIES = ["breakeven_5y", "breakeven_10y"]  # nice-to-have, allowed to lag
+
+
 def clean_and_align(df: pd.DataFrame) -> pd.DataFrame:
     """
     FRED series don't all publish on the same days (holidays, data lags,
     gold fix licensing gaps). Forward-fill small gaps, then drop any rows
     still missing data at the start/end where a series hasn't begun yet.
 
-    Also trims the tail to the last date every source series actually had
-    a real (non-NaN, pre-ffill) observation. FRED series like DTWEXBGS
-    often lag a few business days behind gold/rates; without this trim,
-    ffill(limit=5) quietly repeats the last known value for those days,
-    producing fake zero returns right at the end of the series -- exactly
-    the kind of stale-tail artifact that's easy to miss and misread as
-    "the dollar went flat" when it's really just a publication lag.
+    Only CORE_SERIES (what the locked 2-regressor model actually needs)
+    determine the trim cutoff -- the breakeven series are optional extras
+    the model doesn't use for its main prediction, and FRED sometimes
+    publishes them on a noticeably different schedule than the core
+    series. Forcing everything to share one cutoff meant a lagging
+    breakeven pull could hold back real_rate/usd_index/gold data that
+    was actually already current -- exactly the kind of thing that
+    silently stales out a "next day" prediction for no good reason.
     """
     df = df.sort_index()
 
-    # last real observation date per column, before any filling
-    last_real_dates = df.apply(lambda col: col.last_valid_index())
-    cutoff = last_real_dates.min()
+    # cutoff based on CORE series only
+    core_last_dates = df[CORE_SERIES].apply(lambda col: col.last_valid_index())
+    cutoff = core_last_dates.min()
     if cutoff < df.index.max():
         n_trimmed = (df.index > cutoff).sum()
         print(f"Trimming {n_trimmed} trailing row(s) after {cutoff.date()} "
-              f"-- '{last_real_dates.idxmin()}' hadn't published yet.")
+              f"-- '{core_last_dates.idxmin()}' hadn't published yet.")
         df = df.loc[:cutoff]
 
     df = df.ffill(limit=5)  # tolerate short gaps, don't paper over long ones
-    df = df.dropna()
+
+    # only require CORE_SERIES to be non-null; optional series (breakevens)
+    # can be NaN at the tail without dropping otherwise-good core rows
+    df = df.dropna(subset=CORE_SERIES)
     return df
 
 
@@ -86,7 +114,10 @@ def add_log_returns(df: pd.DataFrame) -> pd.DataFrame:
     out["real_rate_diff"] = df["real_rate"].diff()
     out["breakeven_5y_diff"] = df["breakeven_5y"].diff()
     out["breakeven_10y_diff"] = df["breakeven_10y"].diff()
-    return out.dropna()
+    # only require the CORE columns to be non-null; breakeven diffs are
+    # optional extras and shouldn't drop otherwise-good trailing rows
+    core_derived = ["gold_logret", "usd_logret", "real_rate_diff"]
+    return out.dropna(subset=core_derived)
 
 
 def main():
