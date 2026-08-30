@@ -40,6 +40,7 @@ SIGMA_BETA = {"real_rate_diff": 0.000197, "usd_logret": 0.000622}
 # --- real calibration bucket edges + train hit rates (tvp_calibration.py) ---
 BUCKET_EDGES = [-np.inf, 0.099, 0.238, 0.402, 0.660, np.inf]
 BUCKET_HIT_RATES = [0.5870, 0.5819, 0.6678, 0.7305, 0.8179]
+LONG_ONLY_MIN_BUCKET = 2  # sit out buckets 0-1 entirely in long-only variants
 
 
 def bucket_for(z):
@@ -88,24 +89,30 @@ def main():
     test_hit_rate = hit_rate[test_slice]
 
     variants = {
-        "Half-Kelly, long/short":    (0.5,  False),
-        "Quarter-Kelly, long/short": (0.25, False),
-        "Half-Kelly, long-only":     (0.5,  True),
-        "Quarter-Kelly, long-only":  (0.25, True),
+        "Half-Kelly, long/short":              (0.5,  False, False),
+        "Quarter-Kelly, long/short":            (0.25, False, False),
+        "Half-Kelly, long-only":                (0.5,  True,  False),
+        "Quarter-Kelly, long-only":             (0.25, True,  False),
+        "Half-Kelly, long-only, bucket>=2":     (0.5,  True,  True),
+        "Quarter-Kelly, long-only, bucket>=2":  (0.25, True,  True),
     }
 
     print(f"--- Sizing variant comparison on holdout ({test_valid.sum()} valid obs) ---")
-    print(f"{'Variant':<30} {'Total ret':>10} {'Max DD':>10} {'Sharpe-like':>12} {'Days in market':>15}")
+    print(f"{'Variant':<38} {'Total ret':>10} {'Max DD':>10} {'Sharpe-like':>12} {'Days in market':>15}")
 
     equity_curves = {}
-    for name, (kelly_scale, long_only) in variants.items():
+    for name, (kelly_scale, long_only, min_bucket_filter) in variants.items():
         f_full = np.maximum(2 * test_hit_rate - 1, 0.0)
         f = f_full * kelly_scale
 
+        eligible = test_valid.copy()
+        if min_bucket_filter:
+            eligible = eligible & (bucket[test_slice] >= LONG_ONLY_MIN_BUCKET)
+
         if long_only:
-            position = np.where(test_valid & (test_sign > 0), f, 0.0)
+            position = np.where(eligible & (test_sign > 0), f, 0.0)
         else:
-            position = np.where(test_valid, f * test_sign, 0.0)
+            position = np.where(eligible, f * test_sign, 0.0)
 
         daily_ret = position * test_ret
         equity = np.cumprod(1 + daily_ret)
@@ -116,11 +123,29 @@ def main():
         sr = sharpe_like(pd.Series(daily_ret))
         days_in_market = (position != 0).mean()
 
-        print(f"{name:<30} {total_ret:>10.2%} {dd:>10.2%} {sr:>12.2f} {days_in_market:>14.1%}")
+        print(f"{name:<38} {total_ret:>10.2%} {dd:>10.2%} {sr:>12.2f} {days_in_market:>14.1%}")
+
+    # --- buy-and-hold benchmark: context only, not a fair comparison (no ---
+    # signal, no risk management, always fully exposed) but the reference
+    # point everything else should be judged against
+    bh_daily_ret = np.where(test_valid, test_ret, 0.0)
+    bh_equity = np.cumprod(1 + bh_daily_ret)
+    equity_curves["Buy-and-hold"] = bh_equity
+    bh_total_ret = bh_equity[-1] - 1
+    bh_dd = max_drawdown(bh_equity)
+    bh_sr = sharpe_like(pd.Series(bh_daily_ret))
+    print(f"{'Buy-and-hold':<38} {bh_total_ret:>10.2%} {bh_dd:>10.2%} {bh_sr:>12.2f} {'100.0%':>14}")
 
     print("\nRows 1 vs 2 isolate the Kelly-fraction effect (half vs quarter, both long/short).")
     print("Rows 1 vs 3 isolate the long-only effect (both half-Kelly).")
-    print("Row 4 is the realistic Roth IRA version: quarter-Kelly AND no shorting.")
+    print("Rows 3 vs 5 (and 4 vs 6) isolate the bucket>=2 filter effect: does sitting")
+    print("out low-confidence days entirely beat sizing them small but nonzero?")
+    print("Row 6 (quarter-Kelly, long-only, bucket>=2) is the closest match to")
+    print("'only bet when there's real edge, never short' -- the actual rule discussed.")
+    print("Buy-and-hold is context, not a fair fight: no signal, no risk management,")
+    print("always fully exposed. Judge everything else against it, but expect the")
+    print("sized strategies to win mainly on risk-adjusted terms (Sharpe, drawdown),")
+    print("not necessarily on raw total return every single time.")
 
     test_dates = df.index[split:]
     fig, ax = plt.subplots(figsize=(11, 5))
