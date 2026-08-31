@@ -36,7 +36,7 @@ from fredapi import Fred
 from tvp_gold_model import TVPRegression
 
 DATA_PATH = "gold_macro_data.csv"
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "<Key>")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "YOURKEY")
 REGRESSORS = ["real_rate_diff", "usd_logret"]
 HYPOTHETICAL_DOLLARS = 1000
 
@@ -71,14 +71,32 @@ def main():
     gap_start = last_archived_date - pd.Timedelta(days=5)  # buffer for diffing + holidays
 
     real_rate_gap = fred.get_series("DFII10", observation_start=gap_start)
+    last_real_rate_date = real_rate_gap.index.max()  # capture BEFORE any ffill hides this
+
     usd_proxy_gap = yf.download("DX-Y.NYB", start=gap_start, progress=False,
                                  auto_adjust=True)["Close"]
+    # nominal 10Y yield (CBOE ^TNX, quoted as yield*10) as a proxy for
+    # DFII10's day-of change when the real series hasn't posted yet.
+    # Justified because nominal_yield = real_yield + breakeven inflation,
+    # and breakeven inflation moves much less day-to-day than the nominal
+    # yield does -- so a day's nominal move is a reasonable stand-in for
+    # that same day's real-yield move, NOT an exact match.
+    nominal_10y_gap = yf.download("^TNX", start=gap_start, progress=False,
+                                   auto_adjust=True)["Close"] / 10.0
     if hasattr(usd_proxy_gap, "columns"):
         usd_proxy_gap = usd_proxy_gap.iloc[:, 0]
+    if hasattr(nominal_10y_gap, "columns"):
+        nominal_10y_gap = nominal_10y_gap.iloc[:, 0]
 
     gap_df = pd.DataFrame({"real_rate": real_rate_gap}).join(
         pd.DataFrame({"usd_proxy": usd_proxy_gap}), how="outer"
-    ).ffill().dropna()
+    ).join(pd.DataFrame({"nominal_10y": nominal_10y_gap}), how="outer")
+    gap_df["usd_proxy"] = gap_df["usd_proxy"].ffill()
+    gap_df["nominal_10y"] = gap_df["nominal_10y"].ffill()
+    # NOTE: deliberately NOT ffilling 'real_rate' here -- we want its
+    # trailing NaNs to survive so we can tell exactly which days are
+    # genuinely missing and substitute the nominal proxy for THOSE
+    # days specifically, rather than blur the distinction with ffill.
 
     # diff BEFORE filtering to post-archive dates -- otherwise the first
     # retained day has nothing left to diff against, pandas correctly
@@ -87,6 +105,7 @@ def main():
     # of silent-zero bug this project has spent all day hunting for
     gap_df["real_rate_diff"] = gap_df["real_rate"].diff()
     gap_df["usd_logret"] = np.log(gap_df["usd_proxy"] / gap_df["usd_proxy"].shift(1))
+    gap_df["nominal_10y_diff"] = gap_df["nominal_10y"].diff()
 
     gap_df = gap_df[gap_df.index > last_archived_date]
 
@@ -94,6 +113,19 @@ def main():
         print("No new data beyond the archive -- FRED/proxy haven't advanced. "
               "Nothing to bridge; run tvp_forward_prediction.py as-is.")
         return
+
+    # for days beyond real_rate's last published date, substitute the
+    # nominal-yield proxy's diff instead of leaving a fake/missing value --
+    # a real, if imperfect, stand-in rather than an assumed-flat placeholder
+    stale_days = gap_df.index[gap_df.index > last_real_rate_date]
+    if len(stale_days) > 0:
+        print(f"\n*** real_rate (DFII10) hasn't published beyond "
+              f"{last_real_rate_date.date()} yet. ***")
+        print(f"*** Substituting the nominal 10Y yield's day-of change "
+              f"(^TNX) for {[d.date() for d in stale_days]}. ***")
+        print("*** This assumes breakeven inflation held roughly steady that "
+              "day -- a reasonable approximation, not the real TIPS move. ***\n")
+        gap_df.loc[stale_days, "real_rate_diff"] = gap_df.loc[stale_days, "nominal_10y_diff"]
 
     gap_df = gap_df.dropna(subset=["real_rate_diff", "usd_logret"])
     if gap_df.empty:

@@ -84,6 +84,25 @@ see the docstring in `tvp_gold_model.py` for the full test.
   (~6) is implausibly high by real-world standards and should be read as
   "this specific holdout window was unusually favorable," not "this beats
   professional funds."
+- **Long-only has a real, measurable cost, not just a theoretical one.**
+  Removing shorting entirely (to match a standard cash-account Roth IRA,
+  which can't short) dropped the Sharpe-like ratio from 6.04 to 4.98 at
+  the same Kelly fraction, with max drawdown barely changing (-1.63% ->
+  -1.55%). In this specific window, avoiding shorts mostly gave up
+  upside rather than avoiding downside -- which doesn't undercut the
+  structural case against shorting (a short's loss is unbounded, a
+  long's is capped at 100%), it just means this particular backtest
+  window never hit the scenario where that structural risk bites.
+- **Manually excluding low-confidence buckets (0-1) from a long-only
+  strategy made things WORSE, not better.** Half-Kelly long-only with
+  all buckets included returned 89.01%; restricting to bucket>=2 only
+  dropped that to 80.54%, with Sharpe falling too (4.98 -> 4.66) and
+  almost no drawdown improvement (-1.55% -> -1.49%). The reason: Kelly
+  sizing already discounts weak-edge buckets correctly (bucket 0's 8.7%
+  stake reflects its thin 58.7% edge) -- manually zeroing them out on
+  top of that doesn't remove risk that wasn't already handled, it just
+  throws away real, if modest, positive-expectancy bets. See
+  `tvp_sizing_variants.py`.
 - **Gold's dollar sensitivity is currently far above what pure currency
   mechanics would predict.** If gold's USD price moved purely because
   it's dollar-denominated (the "numeraire effect"), `beta_usd` should sit
@@ -108,24 +127,84 @@ see the docstring in `tvp_gold_model.py` for the full test.
 
   ![Gold's dollar-sensitivity amplification factor over time](dollar_amplification.png)
 
-## Honest limitations
+## Live forecasting: two FRED series lag, and that's not a bug
 
-- One signal pair, one asset. Real systematic strategies lean on
-  *breadth* — many weak, partially independent signals — more than on
-  any single signal being individually strong. A genuinely more complete
-  version of this would be hierarchical, pooling partial evidence across
-  many macro factors/asset classes, not just two.
-- One train/test split, one historical regime mix (2006-2022 train,
-  2022-2026 test). That test window looks like an easy trending period
-  for directional calls — no guarantee this generalizes to a choppier
-  regime.
-- No transaction costs, no taxes, no capacity constraints modeled. Fine
-  for a backtest exploring whether the *methodology* holds up; not fine
-  as a real strategy P&L.
-- The forward-prediction script (`tvp_forward_prediction.py`) requires an
-  explicit scenario for future real-rate/dollar moves — there's no way
-  around this, since the model's own inputs are same-day changes. A
-  "no view" (flat) scenario correctly forecasts exactly zero.
+`DTWEXBGS` (the broad USD index) has a **structural ~1-week publication
+lag** on FRED -- it's a Fed H.10 statistical release, genuinely slower to
+post than the other series, not a pipeline bug. `DFII10` (the real
+yield) also lags by ~1 business day on any given day, for the mundane
+reason that FRED hasn't finished its daily update yet.
+
+For historical backtesting this doesn't matter -- `fetch_gold_data.py`
+correctly trims to whatever's actually published (only using
+`gold`/`real_rate`/`usd_index` to determine the cutoff; the optional
+breakeven columns are allowed to lag independently without holding back
+data that's already current). But it means the *archived* dataset is
+never quite caught up to "yesterday," which blocks a genuinely live
+"what does the model say about tomorrow" call.
+
+`tvp_bridge_forecast.py` solves this for live use only, never touching
+the archive:
+- Pulls `DFII10` directly from FRED for whatever's missing.
+- If today's `DFII10` genuinely hasn't posted, substitutes that day's
+  move in the **nominal** 10Y yield (`^TNX`) instead of assuming no
+  change -- justified because breakeven inflation expectations move
+  much less day-to-day than nominal yields do, so a nominal move is a
+  reasonable (not exact) stand-in for the same day's real-yield move.
+- Substitutes `DX-Y.NYB` (ICE Dollar Index futures) for the
+  not-yet-published `DTWEXBGS` days.
+- Advances the Kalman filter's state through the bridged days (frozen
+  hyperparameters, no refitting), then forecasts the next trading day
+  off the *current* state instead of a stale one.
+
+None of this proxy data is ever written into `gold_macro_data.csv`.
+Mixing assumed/proxy values into what's supposed to be pure real data
+would quietly contaminate every downstream script that trusts that file
+as ground truth -- a mistake worth avoiding even when the assumption
+seems harmless (an early version of this script silently zero-filled a
+missing `real_rate_diff` this way; the fix was substituting the `^TNX`
+proxy explicitly rather than pretending nothing happened that day).
+
+**Daily live workflow:**
+```
+python fetch_gold_data.py          # refresh with whatever's real
+python tvp_bridge_forecast.py      # bridge the gap, forecast off current state
+```
+Check the printed warnings for which series (if any) needed bridging
+before trusting the forecast.
+
+## Forward paper-trading log
+
+Started 2026-08-31. A backtest assumes perfect knowledge of the day's
+actual macro inputs; a live forecast only has whatever's actually
+knowable (including proxy-bridged data) at the moment a call gets made.
+Those are different questions, and only the second one tells you whether
+this survives contact with real-world data constraints -- not just a
+clean historical dataset.
+
+**Rule, decided and validated, not just a preference:** size every
+bucket per the Kelly table, no manual exclusion of low-confidence
+buckets. Confirmed as the better rule against the naive "skip 0-1"
+instinct (see the sizing-variants finding above) -- Kelly's own math
+already discounts weak edges correctly.
+
+**Standing constraint:** long-only, no shorting, regardless of what the
+model outputs. A short's structural risk (unbounded loss) doesn't
+appear in one backtest's numbers by chance; that's a property of the
+instrument, not something a good historical window can vouch for.
+
+**Log columns:**
+```
+date,scenario,forecast_direction,confidence_bucket,kelly_stake_pct,prior_close,next_close,actual_direction,hit,daily_return,cumulative_return,running_hit_rate
+```
+
+**What to watch for over the next few months isn't any single day's
+outcome -- it's whether the bucket ordering holds.** If bucket 4 keeps
+meaningfully beating bucket 0 over many logged days, the calibration
+survived contact with a new period. If the ordering goes flat or
+scrambles, that's real evidence the calibration decayed -- a legitimate
+trigger to refit, separate from any fixed calendar schedule (see below).
+
 
 ## Pipeline (run in this order)
 
@@ -140,8 +219,11 @@ see the docstring in `tvp_gold_model.py` for the full test.
 | `tvp_breakeven_diagnostic.py` | Delta-correlation check on the two breakeven betas specifically | ~18 min |
 | `tvp_calibration.py` | Confidence-bucket calibration curve (does model confidence predict accuracy?) | ~18 min |
 | `tvp_position_sizing.py` | Half-Kelly position sizing backtest vs. flat sizing vs. buy-and-hold | ~18 min |
+| `tvp_sizing_variants.py` | Half vs. quarter Kelly, long-only vs. long/short, bucket>=2-only vs. all buckets, plus a buy-and-hold benchmark | seconds |
 | `tvp_dollar_amplification.py` | Gold's USD-sensitivity vs. the mechanical -1 currency-pass-through benchmark, full history + current percentile rank | seconds |
-| `tvp_forward_prediction.py` | Scenario-conditional next-day (and rough monthly) prediction using the locked model | seconds |
+| `tvp_forward_prediction.py` | Scenario-conditional next-day (and rough monthly) prediction using the locked model, off the archived (lagged) dataset | seconds |
+| `tvp_bridge_forecast.py` | Same as above, but bridges the FRED publication lag with fast-updating proxies first -- see "Live forecasting" below | seconds |
+| `tvp_grade_latest.py` | Pulls real, fresh gold prices (yfinance) to grade recent forecast calls without waiting on FRED | seconds |
 
 All the PyMC-fitting scripts wrap a black-box Kalman filter likelihood
 from `tvp_gold_model.py`/`tvp_bayes_shrinkage.py` as a PyTensor `Op`
@@ -166,9 +248,11 @@ model has nothing to say without an assumption about where real rates
 and the dollar are headed, and it says so rather than guessing.
 
 This is a live number, not a fixed result: rerun `fetch_gold_data.py`
-then `tvp_forward_prediction.py` for a current call. Like the dollar-
-amplification finding above, treat this as "what the model says today,"
-not "what the model will always say."
+then `tvp_forward_prediction.py` (or `tvp_bridge_forecast.py` for the
+freshest possible inputs) for a current call. Like the dollar-
+amplification finding above, treat this as "what the model said on
+2026-08-21," not "what the model will always say" — check the paper-
+trading log above for what it's actually said since.
 
 ## Requirements
 
