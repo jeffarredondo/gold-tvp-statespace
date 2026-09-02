@@ -25,7 +25,7 @@ import yfinance as yf
 from fredapi import Fred
 
 # --- Config ---
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "YOURKEY")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "KEYHERE")
 START_DATE = "2003-01-01"  # DFII10 doesn't really start clean until ~2003
 GOLD_TICKER = "GC=F"  # COMEX gold futures; use "GLD" for the ETF instead
 
@@ -34,6 +34,9 @@ FRED_SERIES = {
     "usd_index": "DTWEXBGS",
     "breakeven_5y": "T5YIE",
     "breakeven_10y": "T10YIE",
+    "treasury_2y": "DGS2",
+    "treasury_10y": "DGS10",
+    "treasury_3mo": "DGS3MO",
 }
 
 
@@ -62,8 +65,29 @@ def pull_gold_data(ticker: str, start_date: str) -> pd.DataFrame:
     return gold
 
 
+def pull_vix_data(start_date: str) -> pd.DataFrame:
+    raw = yf.download("^VIX", start=start_date, progress=False, auto_adjust=True)
+    vix = raw["Close"].copy()
+    vix.columns = ["vix"]
+    vix.index.name = None
+    print(f"Pulled ^VIX -> 'vix': {len(vix)} obs, "
+          f"{vix.index.min().date()} to {vix.index.max().date()}")
+    return vix
+
+
+def pull_gvz_data(start_date: str) -> pd.DataFrame:
+    raw = yf.download("^GVZ", start=start_date, progress=False, auto_adjust=True)
+    gvz = raw["Close"].copy()
+    gvz.columns = ["gvz"]
+    gvz.index.name = None
+    print(f"Pulled ^GVZ -> 'gvz': {len(gvz)} obs, "
+          f"{gvz.index.min().date()} to {gvz.index.max().date()}")
+    return gvz
+
+
 CORE_SERIES = ["gold", "real_rate", "usd_index"]  # required for the locked model
-OPTIONAL_SERIES = ["breakeven_5y", "breakeven_10y"]  # nice-to-have, allowed to lag
+OPTIONAL_SERIES = ["breakeven_5y", "breakeven_10y",
+                    "treasury_2y", "treasury_10y", "treasury_3mo", "vix", "gvz"]  # exploratory, allowed to lag
 
 
 def clean_and_align(df: pd.DataFrame) -> pd.DataFrame:
@@ -103,10 +127,22 @@ def clean_and_align(df: pd.DataFrame) -> pd.DataFrame:
 def add_log_returns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Per the project guardrails: model in returns/diffs, not levels.
-    - Gold and USD index: log returns (they're strictly positive levels)
-    - Real rate and breakevens: simple diffs (all can dip negative --
+    - Gold, USD index, VIX: log returns (strictly positive levels)
+    - Rates and breakevens: simple diffs (all can dip negative --
       real rates during easy-money periods, breakevens during deflation
       scares like 2008/2020 -- so log returns are undefined for them)
+
+    Three candidate regressors for testing gold's sensitivity to risk
+    appetite and Fed-policy expectations, each meant to capture something
+    genuinely DIFFERENT, not three overlapping views of the same thing:
+      - vix_logret: pure risk-appetite/fear proxy, no rate-market overlap
+      - treasury_2y_diff: near-term Fed-expectation shifts directly (the
+        tenor that reprices fastest and hardest on hike/cut fear)
+      - curve_slope_3mo10y_diff: the Estrella-Mishkin recession-model
+        spread (10Y - 3mo), capturing curve SHAPE / growth expectations,
+        deliberately NOT paired with treasury_2y_diff in the same fit
+        without checking for collinearity first (same trap the 5Y/10Y
+        breakevens fell into)
     """
     out = df.copy()
     out["gold_logret"] = np.log(df["gold"] / df["gold"].shift(1))
@@ -114,8 +150,13 @@ def add_log_returns(df: pd.DataFrame) -> pd.DataFrame:
     out["real_rate_diff"] = df["real_rate"].diff()
     out["breakeven_5y_diff"] = df["breakeven_5y"].diff()
     out["breakeven_10y_diff"] = df["breakeven_10y"].diff()
-    # only require the CORE columns to be non-null; breakeven diffs are
-    # optional extras and shouldn't drop otherwise-good trailing rows
+    out["vix_logret"] = np.log(df["vix"] / df["vix"].shift(1))
+    out["gvz_logret"] = np.log(df["gvz"] / df["gvz"].shift(1))
+    out["treasury_2y_diff"] = df["treasury_2y"].diff()
+    out["curve_slope_3mo10y"] = df["treasury_10y"] - df["treasury_3mo"]
+    out["curve_slope_3mo10y_diff"] = out["curve_slope_3mo10y"].diff()
+    # only require the CORE columns to be non-null; everything else is an
+    # optional extra and shouldn't drop otherwise-good trailing rows
     core_derived = ["gold_logret", "usd_logret", "real_rate_diff"]
     return out.dropna(subset=core_derived)
 
@@ -128,7 +169,9 @@ def main():
 
     fred_raw = pull_fred_data(FRED_API_KEY, START_DATE)
     gold_raw = pull_gold_data(GOLD_TICKER, START_DATE)
-    raw = fred_raw.join(gold_raw, how="outer")
+    vix_raw = pull_vix_data(START_DATE)
+    gvz_raw = pull_gvz_data(START_DATE)
+    raw = fred_raw.join(gold_raw, how="outer").join(vix_raw, how="outer").join(gvz_raw, how="outer")
     clean = clean_and_align(raw)
     modeling_df = add_log_returns(clean)
 

@@ -30,7 +30,8 @@ from tvp_bayes_shrinkage import (
 )
 
 DATA_PATH = "gold_macro_data.csv"
-TRAIN_FRAC = 0.8
+REGRESSORS = ["real_rate_diff", "usd_logret", "gvz_logret"]
+SPLIT_DATE = "2022-07-06"  # same fixed date used throughout every comparison tonight
 
 # beefed up now that a 300/300/4-chain run only took ~5 min on the M4
 DRAWS = 1500
@@ -40,10 +41,25 @@ CHAINS = 4
 
 def main():
     df = pd.read_csv(DATA_PATH, index_col=0, parse_dates=True)
-    endog_full = df["gold_logret"]
-    exog_raw_full = df[["real_rate_diff", "usd_logret"]]
 
-    split = int(len(df) * TRAIN_FRAC)
+    # Restrict to gvz_logret's actual first observation -- otherwise the
+    # early years get treated as fully-missing observations by statsmodels
+    # (any NaN in the design row skips the WHOLE row, not just that
+    # column), giving real_rate/usd_logret worse informational footing
+    # too, not just gvz. Confirmed via testing this doesn't meaningfully
+    # change results (tvp_new_regressor_test.py, restricted vs
+    # unrestricted GVZ comparison came back nearly identical) -- doing it
+    # here too for full consistency with how GVZ was validated.
+    first_valid = df["gvz_logret"].first_valid_index()
+    original_len = len(df)
+    df = df[df.index >= first_valid]
+    print(f"Restricting to {first_valid.date()} onward (gvz_logret's first "
+          f"observation) -- dropped {original_len - len(df)} early rows.\n")
+
+    endog_full = df["gold_logret"]
+    exog_raw_full = df[REGRESSORS]
+
+    split = df.index.searchsorted(pd.Timestamp(SPLIT_DATE))
     split_date = df.index[split]
     print(f"Train: {df.index[0].date()} to {df.index[split-1].date()} "
           f"({split} obs)")
@@ -67,7 +83,7 @@ def main():
     sm_model_train.exog_names = list(exog_train.columns)
     mle_res = sm_model_train.fit(disp=False, maxiter=500)
     mle_params = mle_res.params
-    print("MLE params (sigma2_obs, sigma2_beta_real_rate, sigma2_beta_usd):")
+    print(f"MLE params (sigma2_obs, then sigma2_beta per regressor in order {REGRESSORS}):")
     print(mle_params, "\n")
 
     print("Fitting Bayes shrinkage model on train window "

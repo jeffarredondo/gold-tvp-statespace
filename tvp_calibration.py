@@ -32,8 +32,8 @@ from tvp_gold_model import TVPRegression
 from tvp_bayes_shrinkage import fit_shrinkage_model
 
 DATA_PATH = "gold_macro_data.csv"
-TRAIN_FRAC = 0.8
-REGRESSORS = ["real_rate_diff", "usd_logret"]  # locked: 2-regressor model
+REGRESSORS = ["real_rate_diff", "usd_logret", "gvz_logret"]  # locked: 3-regressor model
+SPLIT_DATE = "2022-07-06"  # same fixed date used throughout every comparison
 N_BUCKETS = 5
 
 DRAWS = 1500
@@ -59,7 +59,20 @@ def forecasts_and_variance(sm_model, params):
 
 def main():
     df = pd.read_csv(DATA_PATH, index_col=0, parse_dates=True)
-    split = int(len(df) * TRAIN_FRAC)
+
+    # restrict to gvz_logret's actual first observation -- same reasoning
+    # as tvp_holdout_backtest.py: any NaN in the design row makes
+    # statsmodels skip the WHOLE observation, not just that column, so
+    # without this the early years give real_rate/usd worse informational
+    # footing too. Confirmed via testing this doesn't meaningfully change
+    # results, doing it here for consistency with how GVZ was validated.
+    first_valid = df["gvz_logret"].first_valid_index()
+    original_len = len(df)
+    df = df[df.index >= first_valid]
+    print(f"Restricting to {first_valid.date()} onward (gvz_logret's first "
+          f"observation) -- dropped {original_len - len(df)} early rows.\n")
+
+    split = df.index.searchsorted(pd.Timestamp(SPLIT_DATE))
 
     endog_full = df["gold_logret"]
     exog_raw_full = df[REGRESSORS]

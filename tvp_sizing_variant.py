@@ -29,17 +29,17 @@ from tvp_gold_model import TVPRegression
 from tvp_calibration import forecasts_and_variance
 
 DATA_PATH = "gold_macro_data.csv"
-REGRESSORS = ["real_rate_diff", "usd_logret"]
-TRAIN_FRAC = 0.8
+REGRESSORS = ["real_rate_diff", "usd_logret", "gvz_logret"]
+SPLIT_DATE = "2022-07-06"  # same fixed date used throughout every comparison
 
-# --- real fitted numbers from tvp_holdout_backtest.py ---
-TRAIN_STD = {"real_rate_diff": 0.050198, "usd_logret": 0.003392}
-SIGMA_OBS = 0.009572
-SIGMA_BETA = {"real_rate_diff": 0.000197, "usd_logret": 0.000622}
+# --- real fitted numbers from tvp_holdout_backtest.py (3-regressor, GVZ-restricted) ---
+TRAIN_STD = {"real_rate_diff": 0.050393, "usd_logret": 0.003527, "gvz_logret": 0.054245}
+SIGMA_OBS = 0.00796
+SIGMA_BETA = {"real_rate_diff": 0.000548, "usd_logret": 0.000481, "gvz_logret": 0.001496}
 
-# --- real calibration bucket edges + train hit rates (tvp_calibration.py) ---
-BUCKET_EDGES = [-np.inf, 0.099, 0.238, 0.402, 0.660, np.inf]
-BUCKET_HIT_RATES = [0.5870, 0.5819, 0.6678, 0.7305, 0.8179]
+# --- real calibration bucket edges + train hit rates (tvp_calibration.py, 3-regressor) ---
+BUCKET_EDGES = [-np.inf, 0.131, 0.306, 0.507, 0.839, np.inf]
+BUCKET_HIT_RATES = [0.5782, 0.6014, 0.6735, 0.7646, 0.8041]
 LONG_ONLY_MIN_BUCKET = 2  # sit out buckets 0-1 entirely in long-only variants
 
 
@@ -64,15 +64,23 @@ def sharpe_like(daily_returns):
 
 def main():
     df = pd.read_csv(DATA_PATH, index_col=0, parse_dates=True)
-    split = int(len(df) * TRAIN_FRAC)
+
+    # restrict to gvz_logret's actual first observation -- same reasoning
+    # as tvp_holdout_backtest.py and tvp_calibration.py
+    first_valid = df["gvz_logret"].first_valid_index()
+    original_len = len(df)
+    df = df[df.index >= first_valid]
+    print(f"Restricting to {first_valid.date()} onward (gvz_logret's first "
+          f"observation) -- dropped {original_len - len(df)} early rows.\n")
+
+    split = df.index.searchsorted(pd.Timestamp(SPLIT_DATE))
 
     std_vec = np.array([TRAIN_STD[r] for r in REGRESSORS])
     exog_full = df[REGRESSORS] / pd.Series(TRAIN_STD)
 
     sm_model = TVPRegression(df["gold_logret"], exog_full)
     sm_model.exog_names = REGRESSORS
-    params = np.array([SIGMA_OBS**2, SIGMA_BETA["real_rate_diff"]**2,
-                        SIGMA_BETA["usd_logret"]**2])
+    params = np.array([SIGMA_OBS**2] + [SIGMA_BETA[r]**2 for r in REGRESSORS])
 
     forecasts, var = forecasts_and_variance(sm_model, params)
     gold_simple_ret = np.expm1(df["gold_logret"].values)

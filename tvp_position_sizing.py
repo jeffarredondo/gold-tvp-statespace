@@ -43,8 +43,8 @@ from tvp_bayes_shrinkage import fit_shrinkage_model
 from tvp_calibration import forecasts_and_variance
 
 DATA_PATH = "gold_macro_data.csv"
-TRAIN_FRAC = 0.8
-REGRESSORS = ["real_rate_diff", "usd_logret"]
+REGRESSORS = ["real_rate_diff", "usd_logret", "gvz_logret"]
+SPLIT_DATE = "2022-07-06"  # same fixed date used throughout every comparison
 N_BUCKETS = 5
 KELLY_SCALE = 0.5  # half-Kelly
 
@@ -67,7 +67,16 @@ def sharpe_like(daily_returns):
 
 def main():
     df = pd.read_csv(DATA_PATH, index_col=0, parse_dates=True)
-    split = int(len(df) * TRAIN_FRAC)
+
+    # restrict to gvz_logret's actual first observation -- same reasoning
+    # as tvp_holdout_backtest.py and tvp_calibration.py
+    first_valid = df["gvz_logret"].first_valid_index()
+    original_len = len(df)
+    df = df[df.index >= first_valid]
+    print(f"Restricting to {first_valid.date()} onward (gvz_logret's first "
+          f"observation) -- dropped {original_len - len(df)} early rows.\n")
+
+    split = df.index.searchsorted(pd.Timestamp(SPLIT_DATE))
 
     endog_full = df["gold_logret"]
     exog_raw_full = df[REGRESSORS]
