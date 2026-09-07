@@ -34,19 +34,11 @@ b2_t = b2_{t-1} + eta2_t   (random walk, eta2 ~ N(0, sigma2_beta2))
 b3_t = b3_{t-1} + eta3_t   (random walk, eta3 ~ N(0, sigma2_beta3))
 ```
 
-- **real_rate_diff**: daily change in the 10Y TIPS real yield (FRED: `DFII10`)
-- **usd_logret**: daily log return of the trade-weighted USD index (FRED: `DTWEXBGS`)
-- **gvz_logret**: daily log return of the CBOE Gold Volatility Index (`^GVZ`
-  via yfinance) — gold's own options-implied forward-looking volatility,
-  added 2026-09-01 after clearing a real bar (see Key Findings below)
-- **gold_logret**: daily log return of gold (via `yfinance`, `GC=F` continuous futures)
-
-Both regressors are standardized (unit variance, using train-only stats)
-before fitting — they live on very different natural scales, and skipping
-this step was an early, real mistake that made one coefficient's noise
-look ~65x larger than the other's when the true gap (after fixing it) was
-closer to ~4x. See `diagnose_tvp_betas.py` / `tvp_breakeven_diagnostic.py`
-for the diagnostic tooling that caught this.
+| Regressor | Source | Sign | Economic interpretation |
+|---|---|---|---|
+| `real_rate_diff` | FRED `DFII10` (10Y TIPS real yield, daily change) | Negative | Higher real rates raise the opportunity cost of holding non-yielding gold |
+| `usd_logret` | FRED `DTWEXBGS` (trade-weighted USD index, log return) | Negative, and amplified | A stronger dollar mechanically compresses USD-priced gold (numeraire effect) -- but gold's beta here runs several times larger than pure currency mechanics would predict (see the amplification finding below), suggesting genuine risk-appetite/reserve-diversification content beyond arithmetic |
+| `gvz_logret` | CBOE `^GVZ` (gold's own options-implied volatility, log return) | **Positive** | The opposite sign convention from equities' "leverage effect" (rising VIX -> falling stocks) -- gold is a safe-haven asset, so rising uncertainty about gold itself tends to coincide with gold being bid up, not sold off |
 
 `^GVZ` only exists from 2008-06-04 onward. Every script that fits the
 3-regressor model restricts training to that date forward on ALL
@@ -57,18 +49,6 @@ during 2006-2008 in the GVZ-inclusive model than in a model without it.
 Confirmed via direct testing that this restriction doesn't meaningfully
 change results — it just removes a legitimate objection before trusting
 them.
-
-## Why not a simpler tool?
-
-`statsmodels.tsa.statespace.structural.UnobservedComponents` with
-`mle_regression=False` looks like it gives time-varying regression
-coefficients, but it doesn't — it has no estimated process variance on
-the regression states, so it's actually **recursive OLS** (converges to
-the static in-sample average, can't track a real regime break). Confirmed
-directly with a synthetic test where the true coefficient shifted
-regimes halfway through the series and the built-in tool completely
-missed it. That's why this project uses a hand-built `MLEModel` instead —
-see the docstring in `tvp_gold_model.py` for the full test.
 
 ## Key findings
 
@@ -135,8 +115,8 @@ see the docstring in `tvp_gold_model.py` for the full test.
   just throws away real, if modest, positive-expectancy bets. See
   `tvp_sizing_variants.py`.
 - **A recurring bug pattern worth naming explicitly: hardcoded regressor
-  names left over from the 2-regressor era.** Twice during the GVZ
-  rollout, a script crashed or would have silently used stale values
+  names left over from the 2-regressor era.** Multiple times during the
+  GVZ rollout, a script crashed or would have silently used stale values
   because a `params` array or beta printout referenced
   `SIGMA_BETA["real_rate_diff"]`/`["usd_logret"]` by name instead of
   looping over the current `REGRESSORS` list. Fixed by building these
@@ -155,140 +135,95 @@ see the docstring in `tvp_gold_model.py` for the full test.
   flight-to-safety episode). See `tvp_dollar_amplification.py`.
 
   **This is a point-in-time snapshot, not a permanent structural fact,**
-  and it's specifically a 2-regressor-model number — `tvp_dollar_amplification.py`
-  hasn't been rerun against the 3-regressor model yet. With GVZ now
-  absorbing some of what was previously attributed to `beta_usd`, the
-  amplification reading will very likely be smaller once recomputed
-  (GVZ and the dollar plausibly share some variance during risk-off
-  episodes). Rerunning this script under the 3-regressor model is the
-  natural next follow-up, not done here.
+  and the underlying model changed since that reading — as of 2026-08-28,
+  under the now-locked 3-regressor model (rerun, not anecdotal), the
+  fitted `beta_usd` amplification is **3.22x**, over a 2008-2026 history
+  (GVZ doesn't exist before 2008, so the 3-regressor version's history is
+  necessarily shorter than the 2-regressor version's full 20 years):
+  mean 1.24x, range -0.63x to 3.72x. Current reading sits at the **98.8th
+  percentile** of that history — still near an extreme, genuinely lower
+  than the 2-regressor model's 4.19x/99.1st-percentile reading, consistent
+  with GVZ now absorbing some of what USD used to carry alone. Rerun
+  `tvp_dollar_amplification.py` for a current number before trusting
+  either figure as still true.
 
   ![Gold's dollar-sensitivity amplification factor over time](dollar_amplification.png)
 
-## Live forecasting: two FRED series lag, and that's not a bug
+## Live forecasting
 
 `DTWEXBGS` (the broad USD index) has a **structural ~1-week publication
-lag** on FRED -- it's a Fed H.10 statistical release, genuinely slower to
+lag** on FRED — it's a Fed H.10 statistical release, genuinely slower to
 post than the other series, not a pipeline bug. `DFII10` (the real
 yield) also lags by ~1 business day on any given day, for the mundane
-reason that FRED hasn't finished its daily update yet.
+reason that FRED hasn't finished its daily update yet. `GC=F` and `^GVZ`
+have no such lag, but both get caught in the archive's trim alongside
+the dollar anyway, since `fetch_gold_data.py` trims the WHOLE dataframe
+to whatever the slowest CORE series has reached.
 
-For historical backtesting this doesn't matter -- `fetch_gold_data.py`
-correctly trims to whatever's actually published (only using
-`gold`/`real_rate`/`usd_index` to determine the cutoff; the optional
-breakeven columns are allowed to lag independently without holding back
-data that's already current). But it means the *archived* dataset is
-never quite caught up to "yesterday," which blocks a genuinely live
-"what does the model say about tomorrow" call.
+**`tvp_bridge_forecast.py` is retired.** Everything it did is now
+superseded by `tvp_bridge_forecast_experiment.py`, which does the same
+job plus the live A/B experiment described below. Don't use the old
+script going forward.
 
-`tvp_bridge_forecast.py` solves this for live use only, never touching
-the archive:
-- Pulls `DFII10` directly from FRED for whatever's missing.
-- If today's `DFII10` genuinely hasn't posted, substitutes that day's
-  move in the **nominal** 10Y yield (`^TNX`) instead of assuming no
-  change -- justified because breakeven inflation expectations move
-  much less day-to-day than nominal yields do, so a nominal move is a
-  reasonable (not exact) stand-in for the same day's real-yield move.
-- Substitutes `DX-Y.NYB` (ICE Dollar Index futures) for the
-  not-yet-published `DTWEXBGS` days.
-- Pulls fresh `^GVZ` directly for the gap window. This ISN'T a proxy —
-  GVZ has no FRED-style publication lag at all, it just gets caught in
-  the archive's trim alongside the dollar (the trim cutoff is driven by
-  the slowest CORE series, currently `usd_index`), so real, current GVZ
-  data exists on Yahoo Finance even when the archive hasn't caught up.
-- Advances the Kalman filter's state through the bridged days (frozen
-  hyperparameters, no refitting), then forecasts the next trading day
-  off the *current* state instead of a stale one.
+### `tvp_bridge_forecast_experiment.py`
 
-None of this proxy data is ever written into `gold_macro_data.csv`.
-Mixing assumed/proxy values into what's supposed to be pure real data
-would quietly contaminate every downstream script that trusts that file
-as ground truth -- a mistake worth avoiding even when the assumption
-seems harmless (an early version of this script silently zero-filled a
-missing `real_rate_diff` this way; the fix was substituting the `^TNX`
-proxy explicitly rather than pretending nothing happened that day).
+This runs TWO forecasts for the SAME target day (the next trading day
+after the last genuinely closed session), sharing one Kalman filter
+state, differing only in what fills in "what will today's inputs be":
+
+- **EOD_TREND**: today's regressors assumed equal to their trailing
+  15-day average. No new information about today at all — a pure
+  extrapolation from the last completed close.
+- **SINCE_LAST_CLOSE**: today's real_rate_diff/usd_logret computed from
+  the ACTUAL move already visible in `^TNX` and `DX-Y.NYB` between
+  yesterday's close and right now. `gvz_logret` still uses the trailing
+  average in both — GVZ is priced from GLD options, which aren't open
+  pre-market, so there's no real overnight GVZ reading to substitute.
+
+This tests one specific, real question that a backtest structurally
+*cannot* answer (every historical script always has complete, settled
+data — there's no such thing as a partial day in the archive): does the
+dollar/rate market's overnight move carry genuine information about
+today's close, beyond what a trend-persists guess already captures?
+
+**Real bugs found and fixed while building this, worth knowing about if
+you're extending it further:**
+- An earlier version filled the bridge days' gold return with a fake
+  `0` instead of the real, already-known `GC=F` close for those already-
+  completed sessions. `0` isn't "unknown" to a Kalman filter — it's an
+  active claim that gold definitely didn't move, and the filter's
+  update step would genuinely (and wrongly) correct beta based on that
+  fiction. Fixed to pull real gold closes for the bridge window.
+- An earlier version excluded "today's calendar date" unconditionally,
+  regardless of what time it was run — meaning it stayed one day stale
+  even hours after the market had genuinely closed. Fixed to check real
+  Eastern time against each instrument's actual settlement window
+  (`DX-Y.NYB` and `^TNX` both settle their daily bar around 2:59-3:00pm
+  ET specifically, confirmed via ICE's own contract documentation and
+  multiple quote sources for `^TNX` — not the 5pm guess used initially).
+- The "what's the last closed day" logic originally used naive calendar
+  arithmetic (`today - 1 day`), which breaks on Mondays (lands on
+  Sunday, never a trading day) and on any market holiday. Fixed to
+  derive the last closed day from the ACTUAL data returned, not a
+  calendar rule — weekends and holidays are handled automatically since
+  neither has real rows to find.
 
 **Daily live workflow:**
 ```
-python fetch_gold_data.py          # refresh with whatever's real
-python tvp_bridge_forecast.py      # bridge the gap, forecast off current state
-```
-Check the printed warnings for which series (if any) needed bridging
-before trusting the forecast.
-
-## Forward paper-trading log
-
-Started 2026-08-31. A backtest assumes perfect knowledge of the day's
-actual macro inputs; a live forecast only has whatever's actually
-knowable (including proxy-bridged data) at the moment a call gets made.
-Those are different questions, and only the second one tells you whether
-this survives contact with real-world data constraints -- not just a
-clean historical dataset.
-
-**Rule, decided and validated, not just a preference:** size every
-bucket per the Kelly table, no manual exclusion of low-confidence
-buckets. Confirmed as the better rule against the naive "skip 0-1"
-instinct (see the sizing-variants finding above) -- Kelly's own math
-already discounts weak edges correctly.
-
-**Standing constraint:** long-only, no shorting, regardless of what the
-model outputs. A short's structural risk (unbounded loss) doesn't
-appear in one backtest's numbers by chance; that's a property of the
-instrument, not something a good historical window can vouch for.
-
-**Log columns:**
-```
-date,scenario,forecast_direction,confidence_bucket,kelly_stake_pct,prior_close,next_close,actual_direction,hit,daily_return,cumulative_return,running_hit_rate
+python fetch_gold_data.py                      # refresh with whatever's real
+python tvp_bridge_forecast_experiment.py       # get both forecasts, log both
 ```
 
-**What to watch for over the next few months isn't any single day's
-outcome -- it's whether the bucket ordering holds.** If bucket 4 keeps
-meaningfully beating bucket 0 over many logged days, the calibration
-survived contact with a new period. If the ordering goes flat or
-scrambles, that's real evidence the calibration decayed -- a legitimate
-trigger to refit, separate from any fixed calendar schedule (see below).
+None of this proxy/bridge data is ever written into `gold_macro_data.csv`
+— every number is reconstructed fresh each run, so the archive stays
+100% real.
 
-## Honest limitations
 
-- Three signals, one asset. Real systematic strategies lean on
-  *breadth* — many weak, partially independent signals — more than on
-  a handful being individually strong. GVZ going from "candidate" to
-  "included" is a step in that direction, not the end of it; a
-  genuinely more complete version of this would be hierarchical,
-  pooling partial evidence across many macro/vol factors, not three.
-- One train/test split, one historical regime mix (2008-2022 train,
-  2022-2026 test, for the 3-regressor model). That test window looks
-  like an easy trending period for directional calls — no guarantee
-  this generalizes to a choppier regime.
-- No transaction costs, no taxes, no capacity constraints modeled in the
-  backtests. A cash-account Roth IRA sidesteps the tax question entirely
-  (no gains reporting on any holding period, ever), which is a genuinely
-  good fit for a daily-rebalanced strategy — but the backtests
-  themselves still don't model costs, so treat them as testing the
-  *methodology*, not a realized P&L.
-- The forward-prediction scripts require an explicit scenario for
-  future real-rate/dollar/GVZ moves — there's no way around this, since
-  the model's own inputs are same-day changes. A "no view" (flat)
-  scenario correctly forecasts exactly zero.
-- **When to refit is deliberately NOT on a fixed calendar.** The beta
-  *state* updates continuously, by construction, every time new data
-  comes in — that's the entire point of a Kalman filter, and it needs
-  no manual "update." What's frozen is the *hyperparameters* (the
-  hard-coded `sigma_beta`/`sigma_obs` values and calibration buckets
-  scattered through the live-forecast scripts) — fit once, on data
-  through July 2022. Refitting too often costs real validation data (you
-  consume holdout every time you fold more history into training) for a
-  process that, based on the two extreme-amplification periods found so
-  far (2008, 2026 — eighteen years apart), looks like it moves on a
-  multi-year cadence anyway. The honest trigger is the paper-trading
-  log's bucket ordering breaking down, with an annual check-in as a
-  floor, not a fixed quarterly/annual refit regardless of evidence.
-
-## Pipeline (run in this order)
+## Files
 
 | Script | What it does | Runtime |
 |---|---|---|
-| `fetch_gold_data.py` | Pulls DFII10, DTWEXBGS (FRED) and gold futures (yfinance), aligns and cleans, computes log returns/diffs | seconds |
+| `fetch_gold_data.py` | Pulls DFII10, DTWEXBGS (FRED), gold futures, VIX, GVZ (yfinance), aligns and cleans, computes log returns/diffs | seconds |
 | `tvp_gold_model.py` | Defines the custom `TVPRegression` `MLEModel`; MLE point-estimate baseline fit + diagnostic plot | seconds |
 | `diagnose_tvp_betas.py` | Delta/correlation diagnostics on MLE beta paths (catches noise-chasing, variance-trading) | seconds |
 | `tvp_bayes_shrinkage.py` | Library: horseshoe-shrinkage Bayes model (PyMC), reusable fit/forecast functions | ~15-20 min |
@@ -299,10 +234,12 @@ trigger to refit, separate from any fixed calendar schedule (see below).
 | `tvp_position_sizing.py` | Half-Kelly position sizing backtest vs. flat sizing vs. buy-and-hold | ~18 min |
 | `tvp_sizing_variants.py` | Half vs. quarter Kelly, long-only vs. long/short, bucket>=2-only vs. all buckets, plus a buy-and-hold benchmark | seconds |
 | `tvp_new_regressor_test.py` | Tests ONE new candidate regressor at a time against the locked baseline: McNemar's test + sigma_beta check. Change `NEW_REGRESSOR` and rerun for each candidate | ~40-50 min |
-| `tvp_dollar_amplification.py` | Gold's USD-sensitivity vs. the mechanical -1 currency-pass-through benchmark, full history + current percentile rank (2-regressor model, not yet updated for 3) | seconds |
+| `tvp_dollar_amplification.py` | Gold's USD-sensitivity vs. the mechanical -1 currency-pass-through benchmark, full history + current percentile rank (3-regressor model, 2008-2026) | seconds |
 | `tvp_forward_prediction.py` | Scenario-conditional next-day (and rough monthly) prediction using the locked model, off the archived (lagged) dataset | seconds |
-| `tvp_bridge_forecast.py` | Same as above, but bridges the FRED publication lag with fast-updating proxies first -- see "Live forecasting" below | seconds |
+| `tvp_bridge_forecast_experiment.py` | **Current live workflow.** EOD_TREND vs. SINCE_LAST_CLOSE, same target day, shared beta -- see "Live forecasting" above | seconds |
 | `tvp_grade_latest.py` | Pulls real, fresh gold prices (yfinance) to grade recent forecast calls without waiting on FRED | seconds |
+
+`tvp_bridge_forecast.py` is retired — see "Live forecasting" above.
 
 All the PyMC-fitting scripts wrap a black-box Kalman filter likelihood
 from `tvp_gold_model.py`/`tvp_bayes_shrinkage.py` as a PyTensor `Op`
@@ -310,29 +247,6 @@ from `tvp_gold_model.py`/`tvp_bayes_shrinkage.py` as a PyTensor `Op`
 they're slow relative to a native PyMC model — every NUTS step still
 runs a full Kalman filter pass. Ran comfortably on an M4 Mac mini;
 budget accordingly on slower hardware.
-
-## Sample prediction (point-in-time, not a standing forecast)
-
-Output from `tvp_bridge_forecast.py`, 2026-09-01, 3-regressor model,
-"trend persists" scenario (bridging through the most recent real/proxy
-data at the time):
-
-- **Direction: DOWN**, forecast next-day log-return -0.065%
-- **Confidence bucket 0** of 5 (historical hit rate in this bucket: 57.8%)
-- **Half-Kelly stake: 7.8% of capital** — on a hypothetical $1,000,
-  that's **$78.20 short**
-
-Under the standing long-only rule, a short call at bucket 0 means **no
-position taken** — this is a real example of the paper log's most common
-entry so far: a genuine forecast that the sizing/direction rules say to
-skip, not a strong conviction call. The FLAT ("no view") scenario still
-correctly returns exactly $0 staked in every run.
-
-This is a live number, not a fixed result: rerun `fetch_gold_data.py`
-then `tvp_bridge_forecast.py` for a current call. Like the dollar-
-amplification finding above, treat this as "what the model said on
-2026-09-01," not "what the model will always say" — check the paper-
-trading log for what it's actually said since.
 
 ## Requirements
 

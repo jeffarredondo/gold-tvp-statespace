@@ -17,9 +17,22 @@ arithmetic. The interesting claim isn't a fixed multiplier -- it's that
 this multiplier ITSELF moves over time, which is the whole reason a
 time-varying model was worth building instead of a static regression.
 
-Uses the real, already-fitted hyperparameters from the locked 2-regressor
-holdout run (tvp_holdout_backtest.py) -- one fast Kalman smoother pass
-over the full ~20-year history, no new MCMC run needed.
+Uses the real, already-fitted hyperparameters from the locked 3-regressor
+holdout run (tvp_holdout_backtest.py, GVZ-restricted) -- one fast Kalman
+smoother pass, no new MCMC run needed.
+
+NOTE ON DATE RANGE: this is now necessarily shorter than the original
+2-regressor version's ~20-year history. ^GVZ only exists from 2008-06-04
+onward, and the 3-regressor model can't be estimated before that date
+(any NaN in the design matrix makes statsmodels treat the whole
+observation as missing). So this chart covers 2008-2026, not 2003-2026 --
+a real, unavoidable tradeoff of including GVZ, not a bug.
+
+Also fixed here: the original script pulled beta_usd via a hardcoded
+array index (smoothed_state[1]), assuming usd_logret's position in
+REGRESSORS never changes. That's the exact "hardcoded regressor name/
+position" bug pattern documented in the README as a recurring mistake
+during the GVZ rollout -- fixed to look up the index by name instead.
 """
 
 import numpy as np
@@ -29,30 +42,39 @@ import matplotlib.pyplot as plt
 from tvp_gold_model import TVPRegression
 
 DATA_PATH = "gold_macro_data.csv"
-REGRESSORS = ["real_rate_diff", "usd_logret"]
+REGRESSORS = ["real_rate_diff", "usd_logret", "gvz_logret"]
 
-# --- real fitted numbers from tvp_holdout_backtest.py ---
-TRAIN_STD = {"real_rate_diff": 0.050198, "usd_logret": 0.003392}
-SIGMA_OBS = 0.009572
-SIGMA_BETA = {"real_rate_diff": 0.000197, "usd_logret": 0.000622}
+# --- real fitted numbers from tvp_holdout_backtest.py (3-regressor, GVZ-restricted) ---
+TRAIN_STD = {"real_rate_diff": 0.050393, "usd_logret": 0.003527, "gvz_logret": 0.054245}
+SIGMA_OBS = 0.00796
+SIGMA_BETA = {"real_rate_diff": 0.000548, "usd_logret": 0.000481, "gvz_logret": 0.001496}
 
 MECHANICAL_BENCHMARK = 1.0  # pure currency-denomination pass-through
 
 
 def main():
     df = pd.read_csv(DATA_PATH, index_col=0, parse_dates=True)
+
+    # restrict to gvz_logret's actual first observation -- same reasoning
+    # as every other 3-regressor script
+    first_valid = df["gvz_logret"].first_valid_index()
+    original_len = len(df)
+    df = df[df.index >= first_valid]
+    print(f"Restricting to {first_valid.date()} onward (gvz_logret's first "
+          f"observation) -- dropped {original_len - len(df)} early rows.\n")
+
     std_vec = np.array([TRAIN_STD[r] for r in REGRESSORS])
     exog_full = df[REGRESSORS] / pd.Series(TRAIN_STD)
 
     sm_model = TVPRegression(df["gold_logret"], exog_full)
     sm_model.exog_names = REGRESSORS
 
-    params = np.array([SIGMA_OBS**2, SIGMA_BETA["real_rate_diff"]**2,
-                        SIGMA_BETA["usd_logret"]**2])
+    params = np.array([SIGMA_OBS**2] + [SIGMA_BETA[r]**2 for r in REGRESSORS])
     res = sm_model.smooth(params)
 
-    beta_usd_std = res.smoothed_state[1]
-    beta_usd = beta_usd_std / std_vec[1]  # back to original units
+    usd_idx = REGRESSORS.index("usd_logret")  # look up by name, not position
+    beta_usd_std = res.smoothed_state[usd_idx]
+    beta_usd = beta_usd_std / std_vec[usd_idx]  # back to original units
 
     amplification = -beta_usd / MECHANICAL_BENCHMARK
 
@@ -63,8 +85,9 @@ def main():
     pct_rank = (amplification < current).mean()
 
     print(f"Current (as of {df.index[-1].date()}) amplification factor: {current:.2f}x")
-    print(f"20-year history: mean={hist_mean:.2f}x, min={hist_min:.2f}x, max={hist_max:.2f}x")
-    print(f"Current value is at the {pct_rank:.1%} percentile of the full history")
+    print(f"History ({df.index[0].date()} to {df.index[-1].date()}): "
+          f"mean={hist_mean:.2f}x, min={hist_min:.2f}x, max={hist_max:.2f}x")
+    print(f"Current value is at the {pct_rank:.1%} percentile of this history")
     print(f"(1.0x = purely mechanical currency pass-through, no story beyond that)")
 
     fig, ax = plt.subplots(figsize=(11, 5))
@@ -73,7 +96,8 @@ def main():
                label="mechanical benchmark (1.0x)")
     ax.axhline(0, color="gray", linewidth=0.5)
     ax.set_ylabel("Amplification factor (-beta_usd)")
-    ax.set_title("Gold's dollar sensitivity: how far above pure currency mechanics?")
+    ax.set_title("Gold's dollar sensitivity: how far above pure currency mechanics? "
+                  "(3-regressor model, 2008-onward)")
     ax.legend()
     plt.tight_layout()
     plt.savefig("dollar_amplification.png", dpi=150)

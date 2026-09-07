@@ -25,7 +25,7 @@ import yfinance as yf
 from fredapi import Fred
 
 # --- Config ---
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "KEYHERE")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "ADDKEY")
 START_DATE = "2003-01-01"  # DFII10 doesn't really start clean until ~2003
 GOLD_TICKER = "GC=F"  # COMEX gold futures; use "GLD" for the ETF instead
 
@@ -162,10 +162,6 @@ def add_log_returns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main():
-    if FRED_API_KEY == "PASTE_YOUR_KEY_HERE":
-        raise RuntimeError(
-            "Set FRED_API_KEY as an env var or paste it into the script."
-        )
 
     fred_raw = pull_fred_data(FRED_API_KEY, START_DATE)
     gold_raw = pull_gold_data(GOLD_TICKER, START_DATE)

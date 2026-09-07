@@ -45,7 +45,7 @@ from fredapi import Fred
 from tvp_gold_model import TVPRegression
 
 DATA_PATH = "gold_macro_data.csv"
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "KEYHERE")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "ADDKEY")
 REGRESSORS = ["real_rate_diff", "usd_logret", "gvz_logret"]
 HYPOTHETICAL_DOLLARS = 1000
 
@@ -81,8 +81,6 @@ def main():
     last_archived_date = df.index[-1]
     print(f"Archived data (100% real) runs through {last_archived_date.date()}")
 
-    if FRED_API_KEY == "PASTE_YOUR_KEY_HERE":
-        raise RuntimeError("Set FRED_API_KEY as an env var or paste it into the script.")
     fred = Fred(api_key=FRED_API_KEY)
     gap_start = last_archived_date - pd.Timedelta(days=5)  # buffer for diffing + holidays
 
@@ -122,6 +120,26 @@ def main():
     gap_df["gvz_logret"] = np.log(gap_df["gvz"] / gap_df["gvz"].shift(1))
 
     gap_df = gap_df[gap_df.index > last_archived_date]
+
+    # Exclude TODAY's calendar date ONLY if the day's session genuinely
+    # hasn't settled yet, checked against real Eastern time (regardless
+    # of this machine's local timezone) -- not blindly stripped every
+    # time regardless of clock time, which was the earlier version of
+    # this fix. That overcorrected: it made EOD-only lag a full day
+    # behind even hours after COMEX/ICE had actually settled for the
+    # day, for no reason. 5:00pm ET is a conservative settlement cutoff
+    # (COMEX gold's official close is ~1:30pm ET, but the daily
+    # settlement price used by data providers reflects later Globex
+    # activity) -- past that, today's data is real and complete.
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    market_closed_today = now_et.hour >= 16
+    today = pd.Timestamp(now_et.date())
+    if not market_closed_today:
+        dropped_today = gap_df.index[gap_df.index >= today]
+        if len(dropped_today) > 0:
+            print(f"Excluding {[d.date() for d in dropped_today]} -- today's "
+                  f"session isn't complete yet, so it can't be a real diff.")
+            gap_df = gap_df[gap_df.index < today]
 
     if gap_df.empty:
         print("No new data beyond the archive -- FRED/proxy haven't advanced. "
