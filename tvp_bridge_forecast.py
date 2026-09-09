@@ -45,7 +45,7 @@ from fredapi import Fred
 from tvp_gold_model import TVPRegression
 
 DATA_PATH = "gold_macro_data.csv"
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "ADDKEY")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "KEY_NOT_SET")
 REGRESSORS = ["real_rate_diff", "usd_logret", "gvz_logret"]
 HYPOTHETICAL_DOLLARS = 1000
 

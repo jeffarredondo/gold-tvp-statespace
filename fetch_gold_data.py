@@ -25,7 +25,7 @@ import yfinance as yf
 from fredapi import Fred
 
 # --- Config ---
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "ADDKEY")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "KEY_NOT_SET")
 START_DATE = "2003-01-01"  # DFII10 doesn't really start clean until ~2003
 GOLD_TICKER = "GC=F"  # COMEX gold futures; use "GLD" for the ETF instead
 

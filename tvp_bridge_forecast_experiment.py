@@ -46,7 +46,7 @@ from fredapi import Fred
 from tvp_gold_model import TVPRegression
 
 DATA_PATH = "gold_macro_data.csv"
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "ADDKEY")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "KEY_NOT_SET")
 REGRESSORS = ["real_rate_diff", "usd_logret", "gvz_logret"]
 HYPOTHETICAL_DOLLARS = 1000
 
@@ -132,10 +132,27 @@ def bridge_to_yesterday(df, last_archived_date, fred):
     merged["gvz"] = merged["gvz"].ffill()
     merged["gold"] = merged["gold"].ffill()
 
-    merged["real_rate_diff"] = merged["real_rate"].diff()
-    merged["usd_logret"] = np.log(merged["usd_proxy"] / merged["usd_proxy"].shift(1))
-    merged["nominal_10y_diff"] = merged["nominal_10y"].diff()
-    merged["gvz_logret"] = np.log(merged["gvz"] / merged["gvz"].shift(1))
+    # NOTE: plain .diff()/.shift() here would be positionally wrong --
+    # the outer join creates rows for dates where SOME series traded but
+    # others didn't (e.g. currency futures trade on a US bond-market
+    # holiday), leaving a real NaN gap in between. .diff() subtracts the
+    # IMMEDIATELY PRECEDING ROW, not the last real value, so a single
+    # NaN day silently poisons the very next real day's diff into NaN
+    # too, even though that next day's own value is perfectly valid.
+    # Fix: drop each series' own NaNs first, diff against its own last
+    # real observation (however many calendar days back that is), then
+    # reindex back to the full table -- correctly leaves NaN only on
+    # days that series itself has no value, not on the day after a gap.
+    def _safe_diff(s):
+        return s.dropna().diff().reindex(s.index)
+
+    def _safe_logret(s):
+        return np.log(s.dropna() / s.dropna().shift(1)).reindex(s.index)
+
+    merged["real_rate_diff"] = _safe_diff(merged["real_rate"])
+    merged["usd_logret"] = _safe_logret(merged["usd_proxy"])
+    merged["nominal_10y_diff"] = _safe_diff(merged["nominal_10y"])
+    merged["gvz_logret"] = _safe_logret(merged["gvz"])
 
     # Derive "last closed day" from the ACTUAL data returned, not from
     # calendar arithmetic. Naive "today minus 1 day" breaks on Mondays
@@ -148,9 +165,20 @@ def bridge_to_yesterday(df, last_archived_date, fred):
         candidates = merged.index[merged.index < today]
     last_closed_date = candidates.max() if len(candidates) > 0 else today - pd.Timedelta(days=1)
     yesterday_cutoff = last_closed_date + pd.Timedelta(days=1)
-    merged["gold_logret"] = np.log(merged["gold"] / merged["gold"].shift(1))
+    merged["gold_logret"] = _safe_logret(merged["gold"])
 
     # bridge = strictly completed days only (through yesterday)
+    # diagnostic: show each raw series (pre-ffill, pre-dropna) for every
+    # date after the archive, so a missing day is directly visible
+    # instead of silently dropped -- confirms exactly which of the 5
+    # source pulls (real_rate, usd_proxy, nominal_10y, gvz, gold) is
+    # actually missing a date, rather than guessing after the fact
+    diag_window = merged[merged.index > last_archived_date][
+        ["real_rate", "usd_proxy", "nominal_10y", "gvz", "gold"]]
+    print("--- Raw pulled values, pre-ffill/pre-dropna (for diagnosing gaps) ---")
+    print(diag_window)
+    print()
+
     gap_df = merged[(merged.index > last_archived_date) & (merged.index < yesterday_cutoff)]
     stale_days = gap_df.index[gap_df.index > last_real_rate_date] if len(gap_df) else []
     if len(stale_days) > 0:
@@ -185,12 +213,14 @@ def main():
     last_archived_date = df.index[-1]
     print(f"Archived data (100% real) runs through {last_archived_date.date()}")
 
+    if FRED_API_KEY == "PASTE_YOUR_KEY_HERE":
+        raise RuntimeError("Set FRED_API_KEY as an env var or paste it into the script.")
     fred = Fred(api_key=FRED_API_KEY)
 
     gap_df, observed_today = bridge_to_yesterday(df, last_archived_date, fred)
 
     if not gap_df.empty:
-        print(f"\nBridged through last close ({gap_df.index[-1].date()}):")
+        print(f"\nBridged through yesterday ({gap_df.index[-1].date()}):")
         print(gap_df[REGRESSORS])
 
     # --- ONE shared beta, computed through yesterday only ---
@@ -212,7 +242,7 @@ def main():
     beta_cov_std = res.predicted_state_cov[:, :, -1]
     beta_orig = beta_std / std_vec
 
-    print("\nShared beta (as of last close, used by BOTH scenarios below):")
+    print("\nShared beta (as of yesterday's close, used by BOTH scenarios below):")
     for r, b in zip(REGRESSORS, beta_orig):
         print(f"  {r}: {b:.4f}")
 
